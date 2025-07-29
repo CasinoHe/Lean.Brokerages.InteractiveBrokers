@@ -1331,7 +1331,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             // skip the QuentConnect account validation, we are not using it
-            // ValidateSubscription();
+            bool isNeedQCAccount = Config.GetBool("ib-validate-quantconnect-account", false);
+            if (isNeedQCAccount)
+            {
+                ValidateSubscription();
+            }
 
             _isInitialized = true;
             _loadExistingHoldings = loadExistingHoldings;
@@ -1373,31 +1377,39 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _subscriptionManager.SubscribeImpl += (s, t) => Subscribe(s);
             _subscriptionManager.UnsubscribeImpl += (s, t) => Unsubscribe(s);
 
-            Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
-
-            // start IB Gateway
-            var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
-            _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs);
-            _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
-            _ibAutomater.ErrorDataReceived += OnIbAutomaterErrorDataReceived;
-            _ibAutomater.Exited += OnIbAutomaterExited;
-            _ibAutomater.Restarted += OnIbAutomaterRestarted;
-
-            try
+            bool isStartIbAutomater = Config.GetBool("start-ib-automater", true);
+            if (isStartIbAutomater)
             {
-                CheckIbAutomaterError(_ibAutomater.Start(false));
-            }
-            catch
-            {
-                // we are going the kill the deployment, let's clean up the automater
-                _ibAutomater.DisposeSafely();
-                throw;
-            }
+                Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
 
-            // default the weekly restart to one hour before FX market open (GetNextWeekendReconnectionTimeUtc)
-            _weeklyRestartUtcTime = weeklyRestartUtcTime ?? _defaultWeeklyRestartUtcTime;
-            // schedule the weekly IB Gateway restart
-            StartGatewayWeeklyRestartTask();
+                // start IB Gateway
+                var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
+                _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs);
+                _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
+                _ibAutomater.ErrorDataReceived += OnIbAutomaterErrorDataReceived;
+                _ibAutomater.Exited += OnIbAutomaterExited;
+                _ibAutomater.Restarted += OnIbAutomaterRestarted;
+
+                try
+                {
+                    CheckIbAutomaterError(_ibAutomater.Start(false));
+                }
+                catch
+                {
+                    // we are going the kill the deployment, let's clean up the automater
+                    _ibAutomater.DisposeSafely();
+                    throw;
+                }
+
+                // default the weekly restart to one hour before FX market open (GetNextWeekendReconnectionTimeUtc)
+                _weeklyRestartUtcTime = weeklyRestartUtcTime ?? _defaultWeeklyRestartUtcTime;
+                // schedule the weekly IB Gateway restart
+                StartGatewayWeeklyRestartTask();
+            }
+            else
+            {
+                Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Skipping IB Automater start, using existing IB Gateway instance.");
+            }
 
             Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, Account: {account}, AgentDescription: {agentDescription}");
 
