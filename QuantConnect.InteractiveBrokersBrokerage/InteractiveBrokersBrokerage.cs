@@ -715,7 +715,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             if (!IsConnected)
             {
-                if (_ibAutomater.IsWithinScheduledServerResetTimes())
+                if (_ibAutomater != null && _ibAutomater.IsWithinScheduledServerResetTimes())
                 {
                     // Occasionally the disconnection due to the IB reset period might last
                     // much longer than expected during weekends (even up to the cash sync time).
@@ -1003,7 +1003,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             if (!_isDisposeCalled &&
-                !_ibAutomater.IsWithinScheduledServerResetTimes() &&
+                (_ibAutomater == null || !_ibAutomater.IsWithinScheduledServerResetTimes()) &&
                 IsConnected &&
                 // do not run heart beat if we are close to daily restarts
                 DateTime.Now.TimeOfDay < _heartBeatTimeLimit &&
@@ -1283,7 +1283,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             _aggregator.DisposeSafely();
             _ibAutomater?.Stop();
-            _ibAutomater.DisposeSafely();
+            _ibAutomater?.DisposeSafely();
 
             _messagingRateLimiter.DisposeSafely();
             _concurrentHistoryRequests.DisposeSafely();
@@ -2100,7 +2100,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            var isResetTime = _ibAutomater.IsWithinScheduledServerResetTimes();
+            var isResetTime = _ibAutomater != null && _ibAutomater.IsWithinScheduledServerResetTimes();
 
             if (!isResetTime)
             {
@@ -4506,7 +4506,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns>True if selection can take place</returns>
         public bool CanPerformSelection()
         {
-            return !_ibAutomater.IsWithinScheduledServerResetTimes() && IsConnected;
+            return (_ibAutomater == null || !_ibAutomater.IsWithinScheduledServerResetTimes()) && IsConnected;
         }
 
         /// <summary>
@@ -4939,7 +4939,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public override bool ShouldPerformCashSync(DateTime currentTimeUtc)
         {
             return base.ShouldPerformCashSync(currentTimeUtc)
-                && !_ibAutomater.IsWithinScheduledServerResetTimes()
+                && (_ibAutomater == null || !_ibAutomater.IsWithinScheduledServerResetTimes())
                 && IsConnected;
         }
 
@@ -5018,6 +5018,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
+                if (_ibAutomater == null)
+                {
+                    // Skip restart task for remote gateways
+                    Log.Trace("InteractiveBrokersBrokerage.StartGatewayRestartTask(): skipped for remote gateway");
+                    return;
+                }
+
                 if (_isDisposeCalled || IsRestartInProgress())
                 {
                     // if we are disposed or we already triggered the restart skip a new call
@@ -5077,6 +5084,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private void StartGatewayWeeklyRestartTask()
         {
+            if (_ibAutomater == null)
+            {
+                // Skip weekly restart task for remote gateways
+                Log.Trace("InteractiveBrokersBrokerage.StartGatewayWeeklyRestartTask(): skipped for remote gateway");
+                return;
+            }
+
             if (_isDisposeCalled)
             {
                 Log.Trace("InteractiveBrokersBrokerage.StartGatewayWeeklyRestartTask(): skipped request: we are disposed");
@@ -5168,6 +5182,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
+            // Skip processing for remote gateways
+            if (_ibAutomater == null)
+            {
+                Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): Skipping for remote gateway");
+                return;
+            }
+
             // check if IBGateway was closed because of an IBAutomater error, die if so
             var result = _ibAutomater.GetLastStartResult();
             CheckIbAutomaterError(result, false);
@@ -5216,7 +5237,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private TimeSpan GetRestartDelay()
         {
             // during weekends wait until one hour before FX market open before restarting IBAutomater
-            return _ibAutomater.IsWithinWeekendServerResetTimes()
+            return (_ibAutomater != null && _ibAutomater.IsWithinWeekendServerResetTimes())
                ? GetNextWeekendReconnectionTimeUtc() - DateTime.UtcNow
                : _defaultRestartDelay;
         }
@@ -5225,7 +5246,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var utcNow = DateTime.UtcNow;
             // during weekends (including the whole Sunday) we wait until the time configured by the user
-            if (_ibAutomater.IsWithinWeekendServerResetTimes() || utcNow.DayOfWeek == DayOfWeek.Sunday)
+            if ((_ibAutomater != null && _ibAutomater.IsWithinWeekendServerResetTimes()) || utcNow.DayOfWeek == DayOfWeek.Sunday)
             {
                 var delay = GetNextWeeklyRestartTimeUtc(utcNow) - utcNow;
 
@@ -5242,6 +5263,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void OnIbAutomaterRestarted(object sender, EventArgs e)
         {
             Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterRestarted()");
+
+            // Skip processing for remote gateways
+            if (_ibAutomater == null)
+            {
+                Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterRestarted(): Skipping for remote gateway");
+                return;
+            }
 
             _stateManager.Reset();
             StopGatewayRestartTask();
