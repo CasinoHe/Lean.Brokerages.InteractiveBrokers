@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Text;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -41,6 +42,9 @@ using QuantConnect.Tests.Engine;
 using QuantConnect.Tests.Engine.DataFeeds;
 using QuantConnect.Util;
 using Order = QuantConnect.Orders.Order;
+using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
+using QuantConnect.Securities.IndexOption;
+using static QuantConnect.Brokerages.InteractiveBrokers.InteractiveBrokersAccountData;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
@@ -50,17 +54,55 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     {
         private readonly List<Order> _orders = new List<Order>();
 
-        [SetUp]
+        private readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
+
+        private InteractiveBrokersSymbolMapper _symbolMapper = new InteractiveBrokersSymbolMapper(Composer.Instance.GetPart<IMapFileProvider>());
+
+        [OneTimeSetUp]
         public void Setup()
         {
             Log.LogHandler = new NUnitLogHandler();
             PythonInitializer.Initialize();
         }
 
-        [TearDown]
+        [OneTimeTearDown]
         public void TearDown()
         {
             PythonInitializer.Shutdown();
+        }
+
+        [TestCase(-500, 623.794, 100, 622.181, -400, 624.19725, "B")]
+        [TestCase(100, 210.101, -200, 210.044, -100, 209.987, "B")]
+        [TestCase(-500, 623.794, -500, 623.794, -500, 623.794, "A")] // double A is ignored
+        public void MergeHoldingMergesOppositeSignedAAPLPositions(decimal holdingPositionQuantity, decimal holdingAvgPrice, decimal incomePositionQuantity,
+            decimal incomeAvgPrice, decimal expectedNewPositionQuantity, decimal expectedAvgPrice, string incomingAccount)
+        {
+            var aapl = Symbols.AAPL;
+
+            var holdings = new Dictionary<Symbol, MergedHoldings>();
+            holdings[aapl] = new();
+
+            holdings[aapl].Merge(new Holding
+            {
+                Symbol = aapl,
+                Quantity = holdingPositionQuantity,
+                AveragePrice = holdingAvgPrice
+            }, "A");
+
+            var incoming = new Holding
+            {
+                Symbol = aapl,
+                Quantity = incomePositionQuantity,
+                AveragePrice = incomeAvgPrice
+            };
+
+            InteractiveBrokersBrokerage.MergeHolding(holdings, incoming, incomingAccount);
+
+            var merged = holdings[aapl];
+
+            Assert.AreEqual(expectedNewPositionQuantity, merged.Holding.Quantity);
+            Assert.AreEqual(expectedAvgPrice, merged.Holding.AveragePrice);
+            Assert.AreEqual(aapl, merged.Holding.Symbol);
         }
 
         [Test]
@@ -1075,6 +1117,158 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var mondayMarketOpenSecondTickResult = InteractiveBrokersBrokerage.ShouldSkipTick(ndxSecurityExchangeHours, mondayMarketOpenDateTimeFirstTick);
 
             Assert.IsFalse(mondayMarketOpenSecondTickResult);
+        }
+
+        [Test]
+        public void GetTradingClassReturnsTradingClassFromCache()
+        {
+            using var ib = new InteractiveBrokersBrokerage(new QCAlgorithm(), new OrderProvider(), new SecurityProvider());
+            ib.Connect();
+
+            var future = Symbol.CreateFuture(Futures.Indices.SP500EMini, Market.CME, new DateTime(2025, 09, 19));
+            var index = Symbol.Create("SPX", SecurityType.Index, Market.USA);
+            var symbols = new Symbol[]
+            {
+                future,
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Put, 6725m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Call, 6725m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Put, 6750m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Call, 6750m, future.ID.Date),
+
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6300m, new(2025,08,15)),
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6350m, new(2025,08,15)),
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6395m, new(2025,08,15)),
+
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6355m, new(2025,08,15)),
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6320m, new(2025,08,15)),
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6310m, new(2025,08,15)),
+            };
+
+            var stopwatch = Stopwatch.StartNew();
+            foreach (var symbol in symbols)
+            {
+                var contract = CreateContract(symbol);
+                var tradingClass = ib._contractSpecificationService.GetTradingClass(contract, symbol);
+
+                Assert.IsFalse(string.IsNullOrEmpty(tradingClass), $"Trading class should not be null or empty for symbol {symbol}");
+
+                if (symbol.HasCanonical())
+                {
+                    Assert.IsTrue(ib._contractSpecificationService._tradingClassByCanonicalSymbol.TryGetValue(symbol.Canonical, out var contractSpecification),
+                        $"Cache should contain canonical for symbol {symbol}");
+                    Assert.IsNotEmpty(contractSpecification.TradingClass);
+                    Assert.Greater(contractSpecification.MinTick, 0m);
+                }
+                else
+                {
+                    Assert.IsFalse(ib._contractSpecificationService._tradingClassByCanonicalSymbol.ContainsKey(symbol.Canonical));
+                }
+            }
+            stopwatch.Stop();
+            Log.Trace($"Test.GetTradingClassReturnsTradingClassFromCache: performance test elapsed time: {stopwatch.ElapsedMilliseconds} ms");
+
+            ib.Disconnect();
+        }
+
+        private Contract CreateContract(Symbol symbol)
+        {
+            var securityType = InteractiveBrokersBrokerage.ConvertSecurityType(symbol.SecurityType);
+            var ibSymbol = _symbolMapper.GetBrokerageSymbol(symbol);
+
+            var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(
+                symbol.ID.Market,
+                symbol,
+                symbol.SecurityType,
+                Currencies.USD);
+
+            var contract = new Contract
+            {
+                Symbol = ibSymbol,
+                Exchange = InteractiveBrokersBrokerage.GetSymbolExchange(symbol.SecurityType, symbol.ID.Market),
+                SecType = securityType,
+                Currency = symbolProperties.QuoteCurrency
+            };
+
+            if (symbol.ID.SecurityType.IsOption())
+            {
+                // Subtract a day from Index Options, since their last trading date
+                // is on the day before the expiry.
+                var lastTradeDate = symbol.ID.Date;
+                if (symbol.SecurityType == SecurityType.IndexOption)
+                {
+                    lastTradeDate = IndexOptionSymbol.GetLastTradingDate(symbol.ID.Symbol, symbol.ID.Date);
+                }
+                contract.LastTradeDateOrContractMonth = lastTradeDate.ToStringInvariant(DateFormat.EightCharacter);
+
+                contract.Right = symbol.ID.OptionRight == OptionRight.Call ? IB.RightType.Call : IB.RightType.Put;
+
+                contract.Strike = Convert.ToDouble(symbol.ID.StrikePrice);
+
+                contract.Symbol = ibSymbol;
+                contract.Multiplier = symbolProperties.ContractMultiplier.ToStringInvariant();
+            }
+
+            return contract;
+        }
+
+        [Test, Explicit("Long-running test (~10 minutes). Compares LEAN and IB API primary exchanges for up to 1000 equity symbols.")]
+        public void GetEquityPrimaryExchangeShouldMatchBetweenLeanAndIB()
+        {
+            using var ib = new InteractiveBrokersBrokerage(new QCAlgorithm(), new OrderProvider(), new SecurityProvider());
+            ib.Connect();
+
+            var tickers = QuantConnect.Algorithm.CSharp.StressSymbols.StockSymbols.ToList();
+
+            var totalCount = default(int);
+            var equalCount = default(int);
+
+            var logBuilder = new StringBuilder($"***** GetEquityPrimaryExchange Test ({tickers.Count} tickers) *****");
+            var logBuilder2 = new StringBuilder("***** MissMatched Symbols *****");
+
+            foreach (var ticker in tickers)
+            {
+                totalCount++;
+
+                var symbol = Symbol.Create(ticker, SecurityType.Equity, Market.USA);
+
+                var contract = CreateContract(symbol);
+
+                var leanPrimaryExchange = ib.GetPrimaryExchange(contract, symbol);
+
+                var ibPrimaryExchange = ib.GetContractDetails(contract, symbol.Value)?.Contract.PrimaryExch;
+
+                if (ibPrimaryExchange == null)
+                {
+                    totalCount--;
+                    logBuilder.AppendLine($"[SKIP] Contract not found for {symbol}");
+                    continue;
+                }
+
+                if (totalCount == 1000)
+                {
+                    logBuilder.AppendLine("Symbol processing limit reached (1000). Stopping test.");
+                    break;
+                }
+
+                Assert.IsNotNull(leanPrimaryExchange);
+
+                bool isEqual = string.Equals(leanPrimaryExchange, ibPrimaryExchange, StringComparison.InvariantCultureIgnoreCase);
+                if (isEqual)
+                {
+                    logBuilder.AppendLine($"[RESULT] {symbol.Value} | LEAN = {leanPrimaryExchange} | IB API = {ibPrimaryExchange} | Match = {isEqual}");
+                    equalCount++;
+                }
+                else
+                {
+                    logBuilder2.AppendLine($"[RESULT] {symbol.Value} | LEAN = {leanPrimaryExchange} | IB API = {ibPrimaryExchange} | Match = {isEqual}");
+                }
+            }
+
+            logBuilder.AppendLine("----- Test Summary -----");
+            logBuilder.AppendLine($"Processed: {totalCount} | Matches: {equalCount} | Mismatches: {totalCount - equalCount}");
+
+            Log.Trace(logBuilder.ToString());
+            Log.Trace(logBuilder2.ToString());
         }
 
         private List<BaseData> GetHistory(
