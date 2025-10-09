@@ -213,7 +213,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private MapFilePrimaryExchangeProvider _exchangeProvider;
 
         // exchange time zones by symbol
-        private readonly Dictionary<Symbol, DateTimeZone> _symbolExchangeTimeZones = new Dictionary<Symbol, DateTimeZone>();
+        private readonly Dictionary<Symbol, SecurityExchangeHours> _symbolExchangeHours = [];
 
         // IB requests made through the IB-API must be limited to a maximum of 50 messages/3 second
         private readonly RateGate _messagingRateLimiter = new RateGate(50, TimeSpan.FromSeconds(3));
@@ -256,6 +256,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _historyOpenInterestWarning;
         private bool _historyCfdTradeWarning;
         private bool _historyInvalidPeriodWarning;
+
+        /// <summary>
+        /// Tracks whether a warning about safe MarketOnOpen execution has already been sent.
+        /// </summary>
+        /// <remarks>Ensures the warning is raised only once per application run to avoid spamming messages.</remarks>
+        private bool _hasWarnedSafeMooExecution;
 
         // Symbols that IB doesn't support ("No security definition has been found for the request")
         // We keep track of them to avoid flooding the logs with the same error/warning
@@ -416,10 +422,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
-
                 if (!IsConnected)
                 {
+                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
                     OnMessage(
                         new BrokerageMessageEvent(
                             BrokerageMessageType.Warning,
@@ -714,6 +719,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     holdings.Add(holding);
                 }
             }
+
+            // Prevent holdings calculation every time we receive portfolio updates from IB
+            _loadExistingHoldings = false;
 
             return holdings;
         }
@@ -1352,6 +1360,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _loadExistingHoldings = loadExistingHoldings;
             _algorithm = algorithm;
             _orderProvider = orderProvider;
+            ConcurrencyEnabled = true;
 
             if (!string.IsNullOrEmpty(financialAdvisorsGroupFilter))
             {
@@ -1528,52 +1537,70 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
-            int ibOrderId;
-            if (needsNewId)
+            if (TryAvoidMarketOnOpenBoundaryRejection(order.Symbol, order.Type, GetRealTimeTickTime(order.Symbol), out var delay))
             {
-                // the order ids are generated for us by the SecurityTransactionManaer
-                var id = GetNextId();
-                foreach (var newOrder in orders)
-                {
-                    newOrder.BrokerId.Add(id.ToStringInvariant());
-                }
-                ibOrderId = id;
+                _cancellationTokenSource.Token.WaitHandle.WaitOne(delay);
             }
-            else if (order.BrokerId.Any())
-            {
-                // this is *not* perfect code
-                ibOrderId = Parse.Int(order.BrokerId[0]);
-            }
-            else
-            {
-                throw new ArgumentException("Expected order with populated BrokerId for updating orders.");
-            }
-
-            _requestInformation[ibOrderId] = new RequestInformation
-            {
-                RequestId = ibOrderId,
-                RequestType = RequestType.PlaceOrder,
-                AssociatedSymbol = order.Symbol,
-                Message = $"[Id={ibOrderId}] IBPlaceOrder: {order.Symbol.Value} ({GetContractDescription(contract)} )"
-            };
 
             CheckRateLimiting();
 
-            if (order.Type == OrderType.OptionExercise)
+            int ibOrderId;
+            ManualResetEventSlim orderSubmittedEvent = null;
+
+            // Let's lock here so that getting request id and placing the order is atomic.
+            // If there are multiple threads placing orders at the same time, two threads could
+            // get ids but the one with the higher id could place the order first, making the other
+            // order request to fail, since IB will assume the previous request ID was already used.
+            lock (_nextValidIdLocker)
             {
-                // IB API requires exerciseQuantity to be positive
-                _client.ClientSocket.exerciseOptions(ibOrderId, contract, 1, decimal.ToInt32(order.AbsoluteQuantity), _account, 0,
-                    string.Empty, string.Empty, false);
+                if (needsNewId)
+                {
+                    // the order ids are generated for us by the SecurityTransactionManaer
+                    var id = GetNextId();
+                    foreach (var newOrder in orders)
+                    {
+                        newOrder.BrokerId.Add(id.ToStringInvariant());
+                    }
+                    ibOrderId = id;
+                }
+                else if (order.BrokerId.Any())
+                {
+                    // this is *not* perfect code
+                    ibOrderId = Parse.Int(order.BrokerId[0]);
+                }
+                else
+                {
+                    throw new ArgumentException("Expected order with populated BrokerId for updating orders.");
+                }
+
+                Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}. BrokerId: {ibOrderId}");
+
+                _requestInformation[ibOrderId] = new RequestInformation
+                {
+                    RequestId = ibOrderId,
+                    RequestType = RequestType.PlaceOrder,
+                    AssociatedSymbol = order.Symbol,
+                    Message = $"[Id={ibOrderId}] IBPlaceOrder: {order.Symbol.Value} ({GetContractDescription(contract)} )"
+                };
+
+                if (order.Type == OrderType.OptionExercise)
+                {
+                    // IB API requires exerciseQuantity to be positive
+                    _client.ClientSocket.exerciseOptions(ibOrderId, contract, 1, decimal.ToInt32(order.AbsoluteQuantity), _account, 0,
+                        string.Empty, string.Empty, false);
+                }
+                else
+                {
+                    _pendingOrderResponse[ibOrderId] = orderSubmittedEvent = new ManualResetEventSlim(false);
+                    var ibOrder = ConvertOrder(orders, contract, ibOrderId);
+                    _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
+                }
             }
-            else
+
+            if (order.Type != OrderType.OptionExercise)
             {
-                ManualResetEventSlim eventSlim = _pendingOrderResponse[ibOrderId] = eventSlim = new ManualResetEventSlim(false);
-
-                var ibOrder = ConvertOrder(orders, contract, ibOrderId);
-                _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
-
                 var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
-                if (!eventSlim.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responseTimeout))
+                if (!orderSubmittedEvent.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responseTimeout))
                 {
                     if (noSubmissionOrderTypes)
                     {
@@ -1587,7 +1614,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                         if (_pendingOrderResponse.TryRemove(ibOrderId, out var _))
                         {
-                            eventSlim.DisposeSafely();
+                            orderSubmittedEvent.DisposeSafely();
 
                             var orderEvents = orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
                             {
@@ -1604,9 +1631,58 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 else
                 {
-                    eventSlim.DisposeSafely();
+                    orderSubmittedEvent.DisposeSafely();
                 }
             }
+        }
+
+        /// <summary>
+        /// Checks whether a <see cref="OrderType.MarketOnOpen"/> order falls into IB's 
+        /// unsafe submission window (exactly at market close, e.g., 16:00:00 ET),
+        /// which would otherwise be rejected with "Exchange is closed".
+        /// </summary>
+        /// <param name="symbol">The trading symbol for which the order is placed.</param>
+        /// <param name="orderType">The order type being submitted (only MOO is affected).</param>
+        /// <param name="nowExchangeTimeZone">Current exchange-local time.</param>
+        /// <param name="delay">The required delay before safe submission if within the unsafe boundary.
+        /// </param>
+        /// <returns><c>true</c> if submission falls into the unsafe window and a delay is required; otherwise <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// IB rejects MarketOnOpen orders submitted at the exact close boundary
+        /// (<c>16:00:00 ET</c>). This method applies a small delay (default 1s)
+        /// to ensure safe submission.
+        /// </remarks>
+        internal bool TryAvoidMarketOnOpenBoundaryRejection(Symbol symbol, OrderType orderType, in DateTime nowExchangeTimeZone, out TimeSpan delay)
+        {
+            delay = TimeSpan.Zero;
+            if (orderType != OrderType.MarketOnOpen || symbol.SecurityType != SecurityType.Equity || symbol.ID.Market != Market.USA)
+            {
+                return false;
+            }
+
+            var fiveSeconds = TimeSpan.FromSeconds(5);
+
+            // IB rejects MOO orders submitted exactly at this boundary.
+            var marketOnOpenOrderSafeSubmissionStartTime = GetSecurityExchangeHours(symbol).GetLastDailyMarketClose(nowExchangeTimeZone.Add(-fiveSeconds), false);
+
+            // adds a buffer to avoid IB rejecting orders with error '201 - Order rejected - reason: Exchange is closed.'
+            var marketOnOpenOrderSafeSubmissionEndTime = marketOnOpenOrderSafeSubmissionStartTime.Add(fiveSeconds);
+
+            if (nowExchangeTimeZone >= marketOnOpenOrderSafeSubmissionStartTime && nowExchangeTimeZone < marketOnOpenOrderSafeSubmissionEndTime)
+            {
+                if (!_hasWarnedSafeMooExecution)
+                {
+                    _hasWarnedSafeMooExecution = true;
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "SafeMooExecution",
+                        "Delayed MarketOnOpen order submission to avoid IB rejection: '201 - Order rejected - reason: Exchange is closed.'"));
+                }
+
+                delay = marketOnOpenOrderSafeSubmissionEndTime - nowExchangeTimeZone;
+                return true;
+            }
+
+            return false;
         }
 
         private static string GetUniqueKey(Contract contract)
@@ -1640,9 +1716,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="contract">The IB <see cref="Contract"/> object containing contract details.</param>
         /// <param name="symbol">The Lean <see cref="Symbol"/> object representing the security.</param>
         /// <returns>
-        /// The name of the primary exchange as a string.  
-        /// If the market is USA and Lean provides an exchange, that value is returned.  
-        /// Otherwise, falls back to the IB contract's <c>PrimaryExch</c> field.  
+        /// The name of the primary exchange as a string.
+        /// If the market is USA and Lean provides an exchange, that value is returned.
+        /// Otherwise, falls back to the IB contract's <c>PrimaryExch</c> field.
         /// Returns <c>null</c> if no exchange information is available.
         /// </returns>
         internal string GetPrimaryExchange(Contract contract, Symbol symbol)
@@ -2508,7 +2584,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private Order GetOrder(IB.ExecutionDetailsEventArgs executionDetails)
         {
             var mappedSymbol = MapSymbol(executionDetails.Contract);
-            var order = _orderProvider.GetOrdersByBrokerageId(executionDetails.Execution.OrderId).SingleOrDefault(o => o.Symbol == mappedSymbol);
+            var orders = _orderProvider.GetOrdersByBrokerageId(executionDetails.Execution.OrderId);
+            var order = orders.Count == 1
+                ? orders[0]
+                : orders.SingleOrDefault(o => o.Symbol == mappedSymbol);
+
             if (order == null)
             {
                 if (executionDetails.Execution.Liquidation == 1)
@@ -2523,9 +2603,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // this event will add the order into the lean engine
                     OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(order));
                 }
+                else if (orders.Count == 0)
+                {
+                    Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID {executionDetails.Execution.OrderId}");
+                }
                 else
                 {
-                    Log.Error("InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID " + executionDetails.Execution.OrderId);
+                    Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID {executionDetails.Execution.OrderId} " +
+                        $"for symbol {mappedSymbol.ID}. Actual securities traded with this order ID are {string.Join(", ", orders.Select(x => x.Symbol.ID))}");
                 }
             }
 
@@ -2721,7 +2806,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Merges a holding into the current holdings dictionary. 
+        /// Merges a holding into the current holdings dictionary.
         /// If the symbol already exists, quantities are summed and a new weighted average price is calculated.
         /// If it's a new symbol, the holding is added directly.
         /// </summary>
@@ -4117,17 +4202,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private DateTime GetRealTimeTickTime(Symbol symbol)
         {
-            var time = DateTime.UtcNow;
+            return DateTime.UtcNow.ConvertFromUtc(GetSecurityExchangeHours(symbol).TimeZone);
+        }
 
-            DateTimeZone exchangeTimeZone;
-            if (!_symbolExchangeTimeZones.TryGetValue(symbol, out exchangeTimeZone))
+        /// <summary>
+        /// Gets exchange hours for the given <paramref name="symbol"/>, 
+        /// loading from <see cref="MarketHoursDatabase"/> if not cached.
+        /// </summary>
+        /// <param name="symbol">The symbol to look up.</param>
+        /// <returns>The exchange hours for the symbol.</returns>
+        private SecurityExchangeHours GetSecurityExchangeHours(Symbol symbol)
+        {
+            var securityExchangeHours = default(SecurityExchangeHours);
+            lock (_symbolExchangeHours)
             {
-                // read the exchange time zone from market-hours-database
-                exchangeTimeZone = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType).TimeZone;
-                _symbolExchangeTimeZones.Add(symbol, exchangeTimeZone);
+                if (!_symbolExchangeHours.TryGetValue(symbol, out securityExchangeHours))
+                {
+                    // read the exchange time zone from market-hours-database
+                    securityExchangeHours = MarketHoursDatabase.FromDataFolder().GetExchangeHours(symbol.ID.Market, symbol, symbol.SecurityType);
+                    _symbolExchangeHours.Add(symbol, securityExchangeHours);
+                }
             }
 
-            return time.ConvertFromUtc(exchangeTimeZone);
+            return securityExchangeHours;
         }
 
         private void HandleTickPrice(object sender, IB.TickPriceEventArgs e)
@@ -4592,13 +4689,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
-            DateTimeZone exchangeTimeZone;
-            if (!_symbolExchangeTimeZones.TryGetValue(request.Symbol, out exchangeTimeZone))
-            {
-                // read the exchange time zone from market-hours-database
-                exchangeTimeZone = MarketHoursDatabase.FromDataFolder().GetExchangeHours(request.Symbol.ID.Market, request.Symbol, request.Symbol.SecurityType).TimeZone;
-                _symbolExchangeTimeZones.Add(request.Symbol, exchangeTimeZone);
-            }
+            var exchangeTimeZone = GetSecurityExchangeHours(request.Symbol).TimeZone;
 
             // preparing the data for IB request
             var contract = CreateContract(request.Symbol, includeExpired: true);
@@ -4621,7 +4712,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             var resolution = ConvertResolution(request.Resolution);
-
             var startTime = request.Resolution == Resolution.Daily ? request.StartTimeUtc.Date : request.StartTimeUtc;
             var startTimeLocal = startTime.ConvertFromUtc(exchangeTimeZone);
             var endTime = request.Resolution == Resolution.Daily ? request.EndTimeUtc.Date : request.EndTimeUtc;
