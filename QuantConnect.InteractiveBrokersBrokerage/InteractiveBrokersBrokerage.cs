@@ -832,17 +832,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             Log.Trace("InteractiveBrokersBrokerage.Connect(): not connected, start connecting now...");
 
-            var lastAutomaterStartResult = _ibAutomater.GetLastStartResult();
-            if (lastAutomaterStartResult.HasError)
+            if (_ibAutomater != null)
             {
-                lastAutomaterStartResult = _ibAutomater.Start(false);
-                CheckIbAutomaterError(lastAutomaterStartResult);
-                // There was an error but we did not throw, must be another 2FA timeout, we can't continue
+                var lastAutomaterStartResult = _ibAutomater.GetLastStartResult();
                 if (lastAutomaterStartResult.HasError)
                 {
-                    // we couldn't start IBAutomater, so we cannot connect
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "IBAutomaterWarning", $"Unable to restart IBAutomater: {lastAutomaterStartResult.ErrorMessage}"));
-                    return;
+                    lastAutomaterStartResult = _ibAutomater.Start(false);
+                    CheckIbAutomaterError(lastAutomaterStartResult);
+                    // There was an error but we did not throw, must be another 2FA timeout, we can't continue
+                    if (lastAutomaterStartResult.HasError)
+                    {
+                        // we couldn't start IBAutomater, so we cannot connect
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "IBAutomaterWarning", $"Unable to restart IBAutomater: {lastAutomaterStartResult.ErrorMessage}"));
+                        return;
+                    }
                 }
             }
 
