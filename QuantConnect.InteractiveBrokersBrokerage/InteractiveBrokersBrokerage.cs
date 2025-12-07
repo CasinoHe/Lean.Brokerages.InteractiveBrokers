@@ -774,7 +774,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var filter = new ExecutionFilter
             {
                 AcctCode = _account,
-                ClientId = ClientId,
+                ClientId = _clientId,
                 Exchange = exchange,
                 SecType = type ?? IB.SecurityType.Undefined,
                 Symbol = symbol,
@@ -2893,7 +2893,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var ibOrder = new IBApi.Order
             {
-                ClientId = ClientId,
+                ClientId = _clientId,
                 OrderId = ibOrderId,
                 Account = _account,
                 Action = ConvertOrderDirection(direction),
@@ -3977,6 +3977,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 account,
                 host,
                 port,
+                Config.GetInt("ib-client-id", 0),
                 twsDirectory,
                 ibVersion,
                 userId,

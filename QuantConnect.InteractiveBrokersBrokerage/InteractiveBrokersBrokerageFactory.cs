@@ -51,7 +51,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { "ib-trading-mode", Config.Get("ib-trading-mode") },
             { "ib-agent-description", Config.Get("ib-agent-description") },
             { "ib-weekly-restart-utc-time", Config.Get("ib-weekly-restart-utc-time") },
-            { "ib-financial-advisors-group-filter", Config.Get("ib-financial-advisors-group-filter") }
+            { "ib-financial-advisors-group-filter", Config.Get("ib-financial-advisors-group-filter") },
+            { "ib-client-id", Config.Get("ib-client-id", "0") }
         };
 
         /// <summary>
@@ -75,6 +76,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var host = Config.Get("ib-host", "127.0.0.1");
             var twsDirectory = Config.Get("ib-tws-dir", "C:\\Jts");
             var ibVersion = Config.Get("ib-version", InteractiveBrokersBrokerage.DefaultVersion);
+            var clientId = Config.GetInt("ib-client-id", 0);
 
             var account = Read<string>(job.BrokerageData, "ib-account", errors);
             var userId = Read<string>(job.BrokerageData, "ib-user-name", errors);
@@ -114,6 +116,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 account,
                 host,
                 port,
+                clientId,
                 twsDirectory,
                 ibVersion,
                 userId,

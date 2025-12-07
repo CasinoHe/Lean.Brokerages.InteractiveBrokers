@@ -3,6 +3,7 @@
   "data-directory": "../../../../Lean/Data/",
   "ib-user-name": "",
   "ib-account": "",
+  "ib-client-id": 0,
   "ib-password": "",
   "ib-weekly-restart-utc-time": "",
   "ib-trading-mode": "",
