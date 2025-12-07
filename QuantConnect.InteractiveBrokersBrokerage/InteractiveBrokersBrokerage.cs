@@ -106,7 +106,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private IBAutomater.IBAutomater _ibAutomater;
 
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
-        private const int ClientId = 0;
+        private int _clientId;
 
         // daily restart is at 23:45 local host time
         private static TimeSpan _heartBeatTimeLimit = new(23, 0, 0);
@@ -319,6 +319,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         ///     ib-account (required)
         ///     ib-host (optional, defaults to LOCALHOST)
         ///     ib-port (optional, defaults to 4001)
+        ///     ib-client-id (optional, defaults to 0)
         ///     ib-agent-description (optional, defaults to Individual)
         /// </summary>
         /// <param name="algorithm">The algorithm instance</param>
@@ -344,6 +345,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 account,
                 Config.Get("ib-host", "LOCALHOST"),
                 Config.GetInt("ib-port", 4001),
+                Config.GetInt("ib-client-id", 0),
                 Config.Get("ib-tws-dir"),
                 Config.Get("ib-version", DefaultVersion),
                 Config.Get("ib-user-name"),
@@ -364,6 +366,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="account">The Interactive Brokers account name</param>
         /// <param name="host">host name or IP address of the machine where TWS is running. Leave blank to connect to the local host.</param>
         /// <param name="port">must match the port specified in TWS on the Configure&gt;API&gt;Socket Port field.</param>
+        /// <param name="clientId">The unique client ID used to identify this connection. Must be unique per connection. Defaults to 0.</param>
         /// <param name="ibDirectory">The IB Gateway root directory</param>
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
@@ -380,6 +383,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string account,
             string host,
             int port,
+            int clientId,
             string ibDirectory,
             string ibVersion,
             string userName,
@@ -398,6 +402,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 account,
                 host,
                 port,
+                clientId,
                 ibDirectory,
                 ibVersion,
                 userName,
@@ -885,7 +890,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     // we're going to try and connect several times, if successful break
                     Log.Trace("InteractiveBrokersBrokerage.Connect(): calling _client.ClientSocket.eConnect()");
-                    _client.ClientSocket.eConnect(_host, _port, ClientId);
+                    _client.ClientSocket.eConnect(_host, _port, _clientId);
 
                     if (!_connectEvent.WaitOne(TimeSpan.FromSeconds(15)))
                     {
@@ -1339,6 +1344,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="account">The Interactive Brokers account name</param>
         /// <param name="host">host name or IP address of the machine where TWS is running. Leave blank to connect to the local host.</param>
         /// <param name="port">must match the port specified in TWS on the Configure&gt;API&gt;Socket Port field.</param>
+        /// <param name="clientId">The unique client ID used to identify this connection. Must be unique per connection. Defaults to 0.</param>
         /// <param name="ibDirectory">The IB Gateway root directory</param>
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
@@ -1355,6 +1361,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string account,
             string host,
             int port,
+            int clientId,
             string ibDirectory,
             string ibVersion,
             string userName,
@@ -1409,6 +1416,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _account = account;
             _host = host;
             _port = port;
+            _clientId = clientId;
 
             _agentDescription = agentDescription;
 
@@ -1454,7 +1462,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Skipping IB Automater start, using existing IB Gateway instance.");
             }
 
-            Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, Account: {account}, AgentDescription: {agentDescription}");
+            Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, ClientId: {clientId}, Account: {account}, AgentDescription: {agentDescription}");
 
             _client = new IB.InteractiveBrokersClient(_signal);
 
