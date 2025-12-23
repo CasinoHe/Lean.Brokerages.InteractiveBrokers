@@ -40,7 +40,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using QuantConnect.Api;
-using RestSharp;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -56,6 +55,7 @@ using QuantConnect.Data.Auxiliary;
 using QuantConnect.Securities.Forex;
 using QuantConnect.Lean.Engine.Results;
 using System.Runtime.CompilerServices;
+using System.Net.Http;
 
 [assembly: InternalsVisibleTo("QuantConnect.Tests.Brokerages.InteractiveBrokers")]
 
@@ -1690,13 +1690,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return false;
             }
 
-            var fiveSeconds = TimeSpan.FromSeconds(5);
+            var tenSeconds = TimeSpan.FromSeconds(10);
 
             // IB rejects MOO orders submitted exactly at this boundary.
-            var marketOnOpenOrderSafeSubmissionStartTime = GetSecurityExchangeHours(symbol).GetLastDailyMarketClose(nowExchangeTimeZone.Add(-fiveSeconds), false);
+            var marketOnOpenOrderSafeSubmissionStartTime = GetSecurityExchangeHours(symbol).GetLastDailyMarketClose(nowExchangeTimeZone.Add(-tenSeconds), false);
 
             // adds a buffer to avoid IB rejecting orders with error '201 - Order rejected - reason: Exchange is closed.'
-            var marketOnOpenOrderSafeSubmissionEndTime = marketOnOpenOrderSafeSubmissionStartTime.Add(fiveSeconds);
+            var marketOnOpenOrderSafeSubmissionEndTime = marketOnOpenOrderSafeSubmissionStartTime.Add(tenSeconds);
 
             if (nowExchangeTimeZone >= marketOnOpenOrderSafeSubmissionStartTime && nowExchangeTimeZone < marketOnOpenOrderSafeSubmissionEndTime)
             {
@@ -3886,7 +3886,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // As such, we resolve the underlying future to the future with the correct contract month.
                     // There's a chance this can fail, and if it does, we throw because this Symbol can't be
                     // represented accurately in Lean.
-                    var futureSymbol = FuturesOptionsUnderlyingMapper.GetUnderlyingFutureFromFutureOption(leanSymbol, market, contractExpiryDate, _algorithm.Time);
+                    var futureSymbol = FuturesOptionsUnderlyingMapper.GetUnderlyingFutureFromFutureOption(leanSymbol, market, contractExpiryDate,
+                        _algorithm?.GetLocked() == true ? _algorithm.Time : DateTime.UtcNow);
                     if (futureSymbol == null)
                     {
                         // This is the worst case scenario, because we didn't find a matching futures contract for the FOP.
@@ -5648,8 +5649,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     information.Add("organizationId", organizationId);
                 }
-                var request = new RestRequest("modules/license/read", Method.POST) { RequestFormat = DataFormat.Json };
-                request.AddParameter("application/json", JsonConvert.SerializeObject(information), ParameterType.RequestBody);
+                // Create HTTP request
+                using var request = ApiUtils.CreateJsonPostRequest("modules/license/read", information);
                 api.TryRequest(request, out ModulesReadLicenseRead result);
                 if (!result.Success)
                 {
