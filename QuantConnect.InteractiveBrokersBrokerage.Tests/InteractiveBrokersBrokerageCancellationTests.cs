@@ -14,6 +14,7 @@
  */
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using NUnit.Framework;
 using QuantConnect.Brokerages.InteractiveBrokers;
@@ -34,6 +35,25 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 TimeSpan.FromMilliseconds(20));
 
             Assert.AreEqual(signalResponse, received);
+        }
+
+        [Test]
+        public void AttemptsEveryBrokerIdWhenAnEarlierCancellationFails()
+        {
+            var attemptedBrokerIds = new List<string>();
+
+            var success = InteractiveBrokersBrokerage.AttemptAllBrokerageCancellations(
+                new[] { "101", "102", "103" },
+                brokerId =>
+                {
+                    attemptedBrokerIds.Add(brokerId);
+                    return brokerId != "101";
+                });
+
+            Assert.IsFalse(success);
+            CollectionAssert.AreEqual(
+                new[] { "101", "102", "103" },
+                attemptedBrokerIds);
         }
     }
 }
