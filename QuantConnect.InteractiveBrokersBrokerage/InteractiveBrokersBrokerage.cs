@@ -489,10 +489,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Waits for Interactive Brokers to acknowledge a cancellation request
+        /// </summary>
+        /// <param name="pendingResponse">The response signal registered for the brokerage order ID</param>
+        /// <param name="timeout">The maximum acknowledgement wait</param>
+        /// <returns>True when a brokerage response was received before the timeout</returns>
+        internal static bool WaitForCancellationResponse(
+            ManualResetEventSlim pendingResponse,
+            TimeSpan timeout)
+        {
+            return pendingResponse.Wait(timeout);
+        }
+
+        /// <summary>
         /// Cancels the order with the specified ID
         /// </summary>
         /// <param name="order">The order to cancel</param>
-        /// <returns>True if the request was made for the order to be canceled, false otherwise</returns>
+        /// <returns>True if the brokerage acknowledged the cancellation request, false otherwise</returns>
         public override bool CancelOrder(Order order)
         {
             try
@@ -529,14 +542,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     _client.ClientSocket.cancelOrder(orderId, new OrderCancel());
 
-                    if (!eventSlim.Wait(_responseTimeout))
+                    if (!WaitForCancellationResponse(eventSlim, _responseTimeout))
                     {
+                        if (_pendingOrderResponse.TryRemove(orderId, out var pendingResponse))
+                        {
+                            pendingResponse.DisposeSafely();
+                        }
+
                         OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                        return false;
                     }
-                    else
-                    {
-                        eventSlim.DisposeSafely();
-                    }
+
+                    eventSlim.DisposeSafely();
                 }
 
                 // canceled order events fired upon confirmation, see HandleError
