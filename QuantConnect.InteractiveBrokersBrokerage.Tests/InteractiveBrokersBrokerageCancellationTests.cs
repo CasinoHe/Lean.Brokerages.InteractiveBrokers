@@ -14,6 +14,7 @@
  */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using NUnit.Framework;
@@ -54,6 +55,33 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             CollectionAssert.AreEqual(
                 new[] { "101", "102", "103" },
                 attemptedBrokerIds);
+        }
+
+        [Test]
+        public void TimeoutCleanupPreservesNewerWaiterForSameBrokerId()
+        {
+            const int brokerId = 101;
+            var pendingResponses = new ConcurrentDictionary<int, ManualResetEventSlim>();
+            using var olderWaiter = new ManualResetEventSlim(false);
+            using var newerWaiter = new ManualResetEventSlim(false);
+            pendingResponses[brokerId] = newerWaiter;
+
+            var removedOlderWaiter =
+                InteractiveBrokersBrokerage.TryRemoveCancellationResponseWaiter(
+                    pendingResponses,
+                    brokerId,
+                    olderWaiter);
+
+            Assert.IsFalse(removedOlderWaiter);
+            Assert.AreSame(newerWaiter, pendingResponses[brokerId]);
+            newerWaiter.Set();
+            Assert.IsTrue(newerWaiter.Wait(TimeSpan.Zero));
+
+            Assert.IsTrue(InteractiveBrokersBrokerage.TryRemoveCancellationResponseWaiter(
+                pendingResponses,
+                brokerId,
+                newerWaiter));
+            Assert.IsFalse(pendingResponses.ContainsKey(brokerId));
         }
     }
 }

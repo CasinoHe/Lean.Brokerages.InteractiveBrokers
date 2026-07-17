@@ -502,6 +502,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Removes a cancellation response waiter only when the broker ID still maps to that exact waiter
+        /// </summary>
+        /// <param name="pendingResponses">The pending brokerage response waiters</param>
+        /// <param name="brokerageOrderId">The brokerage order ID</param>
+        /// <param name="expectedWaiter">The waiter registered by the cancellation being cleaned up</param>
+        /// <returns>True when the expected waiter was removed</returns>
+        internal static bool TryRemoveCancellationResponseWaiter(
+            ConcurrentDictionary<int, ManualResetEventSlim> pendingResponses,
+            int brokerageOrderId,
+            ManualResetEventSlim expectedWaiter)
+        {
+            return ((ICollection<KeyValuePair<int, ManualResetEventSlim>>)pendingResponses).Remove(
+                new KeyValuePair<int, ManualResetEventSlim>(brokerageOrderId, expectedWaiter));
+        }
+
+        /// <summary>
         /// Attempts cancellation for every brokerage order ID and aggregates the results
         /// </summary>
         /// <param name="brokerageOrderIds">The brokerage order IDs to cancel</param>
@@ -587,9 +603,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             if (!WaitForCancellationResponse(eventSlim, _responseTimeout))
             {
-                if (_pendingOrderResponse.TryRemove(orderId, out var pendingResponse))
+                if (TryRemoveCancellationResponseWaiter(
+                        _pendingOrderResponse,
+                        orderId,
+                        eventSlim))
                 {
-                    pendingResponse.DisposeSafely();
+                    eventSlim.DisposeSafely();
                 }
 
                 OnMessage(new BrokerageMessageEvent(
