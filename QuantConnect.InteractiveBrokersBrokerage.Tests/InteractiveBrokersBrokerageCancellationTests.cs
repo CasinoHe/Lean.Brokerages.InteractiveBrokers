@@ -1,0 +1,87 @@
+/*
+ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
+ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+using NUnit.Framework;
+using QuantConnect.Brokerages.InteractiveBrokers;
+
+namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
+{
+    [TestFixture]
+    public class InteractiveBrokersBrokerageCancellationTests
+    {
+        [TestCase(false)]
+        [TestCase(true)]
+        public void WaitForCancellationResponseReportsWhetherBrokerageResponded(bool signalResponse)
+        {
+            using var response = new ManualResetEventSlim(signalResponse);
+
+            var received = InteractiveBrokersBrokerage.WaitForCancellationResponse(
+                response,
+                TimeSpan.FromMilliseconds(20));
+
+            Assert.AreEqual(signalResponse, received);
+        }
+
+        [Test]
+        public void AttemptsEveryBrokerIdWhenAnEarlierCancellationFails()
+        {
+            var attemptedBrokerIds = new List<string>();
+
+            var success = InteractiveBrokersBrokerage.AttemptAllBrokerageCancellations(
+                new[] { "101", "102", "103" },
+                brokerId =>
+                {
+                    attemptedBrokerIds.Add(brokerId);
+                    return brokerId != "101";
+                });
+
+            Assert.IsFalse(success);
+            CollectionAssert.AreEqual(
+                new[] { "101", "102", "103" },
+                attemptedBrokerIds);
+        }
+
+        [Test]
+        public void TimeoutCleanupPreservesNewerWaiterForSameBrokerId()
+        {
+            const int brokerId = 101;
+            var pendingResponses = new ConcurrentDictionary<int, ManualResetEventSlim>();
+            using var olderWaiter = new ManualResetEventSlim(false);
+            using var newerWaiter = new ManualResetEventSlim(false);
+            pendingResponses[brokerId] = newerWaiter;
+
+            var removedOlderWaiter =
+                InteractiveBrokersBrokerage.TryRemoveCancellationResponseWaiter(
+                    pendingResponses,
+                    brokerId,
+                    olderWaiter);
+
+            Assert.IsFalse(removedOlderWaiter);
+            Assert.AreSame(newerWaiter, pendingResponses[brokerId]);
+            newerWaiter.Set();
+            Assert.IsTrue(newerWaiter.Wait(TimeSpan.Zero));
+
+            Assert.IsTrue(InteractiveBrokersBrokerage.TryRemoveCancellationResponseWaiter(
+                pendingResponses,
+                brokerId,
+                newerWaiter));
+            Assert.IsFalse(pendingResponses.ContainsKey(brokerId));
+        }
+    }
+}

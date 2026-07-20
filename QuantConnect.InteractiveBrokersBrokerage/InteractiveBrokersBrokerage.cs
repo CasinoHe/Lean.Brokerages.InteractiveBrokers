@@ -489,10 +489,61 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Waits for Interactive Brokers to acknowledge a cancellation request
+        /// </summary>
+        /// <param name="pendingResponse">The response signal registered for the brokerage order ID</param>
+        /// <param name="timeout">The maximum acknowledgement wait</param>
+        /// <returns>True when a brokerage response was received before the timeout</returns>
+        internal static bool WaitForCancellationResponse(
+            ManualResetEventSlim pendingResponse,
+            TimeSpan timeout)
+        {
+            return pendingResponse.Wait(timeout);
+        }
+
+        /// <summary>
+        /// Removes a cancellation response waiter only when the broker ID still maps to that exact waiter
+        /// </summary>
+        /// <param name="pendingResponses">The pending brokerage response waiters</param>
+        /// <param name="brokerageOrderId">The brokerage order ID</param>
+        /// <param name="expectedWaiter">The waiter registered by the cancellation being cleaned up</param>
+        /// <returns>True when the expected waiter was removed</returns>
+        internal static bool TryRemoveCancellationResponseWaiter(
+            ConcurrentDictionary<int, ManualResetEventSlim> pendingResponses,
+            int brokerageOrderId,
+            ManualResetEventSlim expectedWaiter)
+        {
+            return ((ICollection<KeyValuePair<int, ManualResetEventSlim>>)pendingResponses).Remove(
+                new KeyValuePair<int, ManualResetEventSlim>(brokerageOrderId, expectedWaiter));
+        }
+
+        /// <summary>
+        /// Attempts cancellation for every brokerage order ID and aggregates the results
+        /// </summary>
+        /// <param name="brokerageOrderIds">The brokerage order IDs to cancel</param>
+        /// <param name="attemptCancellation">The cancellation attempt for one brokerage order ID</param>
+        /// <returns>True only when every brokerage order ID cancellation succeeds</returns>
+        internal static bool AttemptAllBrokerageCancellations(
+            IEnumerable<string> brokerageOrderIds,
+            Func<string, bool> attemptCancellation)
+        {
+            var allSucceeded = true;
+            foreach (var brokerageOrderId in brokerageOrderIds)
+            {
+                if (!attemptCancellation(brokerageOrderId))
+                {
+                    allSucceeded = false;
+                }
+            }
+
+            return allSucceeded;
+        }
+
+        /// <summary>
         /// Cancels the order with the specified ID
         /// </summary>
         /// <param name="order">The order to cancel</param>
-        /// <returns>True if the request was made for the order to be canceled, false otherwise</returns>
+        /// <returns>True if the brokerage acknowledged the cancellation request, false otherwise</returns>
         public override bool CancelOrder(Order order)
         {
             try
@@ -509,43 +560,67 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return false;
                 }
 
-                // this could be better
-                foreach (var id in order.BrokerId)
+                return AttemptAllBrokerageCancellations(order.BrokerId, id =>
                 {
-                    var orderId = Parse.Int(id);
-
-                    _requestInformation[orderId] = new RequestInformation
+                    try
                     {
-                        RequestId = orderId,
-                        RequestType = RequestType.CancelOrder,
-                        AssociatedSymbol = order.Symbol,
-                        Message = $"[Id={orderId}] CancelOrder: " + order
-                    };
-
-                    CheckRateLimiting();
-
-                    var eventSlim = new ManualResetEventSlim(false);
-                    _pendingOrderResponse[orderId] = eventSlim;
-
-                    _client.ClientSocket.cancelOrder(orderId, new OrderCancel());
-
-                    if (!eventSlim.Wait(_responseTimeout))
-                    {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                        return CancelBrokerageOrder(order, id);
                     }
-                    else
+                    catch (Exception err)
                     {
-                        eventSlim.DisposeSafely();
+                        Log.Error(
+                            $"InteractiveBrokersBrokerage.CancelOrder(): OrderID: {order.Id} " +
+                            $"BrokerID: {id} - {err}");
+                        return false;
                     }
-                }
-
-                // canceled order events fired upon confirmation, see HandleError
+                });
             }
             catch (Exception err)
             {
                 Log.Error("InteractiveBrokersBrokerage.CancelOrder(): OrderID: " + order.Id + " - " + err);
                 return false;
             }
+        }
+
+        private bool CancelBrokerageOrder(Order order, string brokerageOrderId)
+        {
+            var orderId = Parse.Int(brokerageOrderId);
+
+            _requestInformation[orderId] = new RequestInformation
+            {
+                RequestId = orderId,
+                RequestType = RequestType.CancelOrder,
+                AssociatedSymbol = order.Symbol,
+                Message = $"[Id={orderId}] CancelOrder: " + order
+            };
+
+            CheckRateLimiting();
+
+            var eventSlim = new ManualResetEventSlim(false);
+            _pendingOrderResponse[orderId] = eventSlim;
+
+            _client.ClientSocket.cancelOrder(orderId, new OrderCancel());
+
+            if (!WaitForCancellationResponse(eventSlim, _responseTimeout))
+            {
+                if (TryRemoveCancellationResponseWaiter(
+                        _pendingOrderResponse,
+                        orderId,
+                        eventSlim))
+                {
+                    eventSlim.DisposeSafely();
+                }
+
+                OnMessage(new BrokerageMessageEvent(
+                    BrokerageMessageType.Error,
+                    "NoBrokerageResponse",
+                    $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                return false;
+            }
+
+            eventSlim.DisposeSafely();
+
+            // canceled order events fired upon confirmation, see HandleError
             return true;
         }
 
