@@ -83,6 +83,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <remarks>I've seen combo limit order take up to 5 seconds to be trigger a submission event</remarks>
         private static readonly TimeSpan _noSubmissionOrdersResponseTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-no-submission-orders-response-timeout", 10));
         private static bool _submissionOrdersWarningSent;
+        private static bool _openOrderTimeWarningSent;
         private bool _sentFAOrderPropertiesWarning;
 
         private readonly HashSet<OrderType> _noSubmissionOrderTypes = new(new[] {
@@ -202,7 +203,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { Market.ICE, "NYBOT" },
             { Market.CFE, "CFE" },
             { Market.NYSELIFFE, "NYSELIFFE" },
-            { Market.EUREX, "EUREX" }
+            { Market.EUREX, "EUREX" },
+            { Market.KRX, "KSE" }
         };
 
         private static readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
@@ -257,6 +259,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _historyOpenInterestWarning;
         private bool _historyCfdTradeWarning;
         private bool _historyInvalidPeriodWarning;
+        private bool _hasLoggedPriceRoundingWarning;
 
         /// <summary>
         /// Tracks whether a warning about safe MarketOnOpen execution has already been sent.
@@ -721,6 +724,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     Log.Trace($"InteractiveBrokersBrokerage.GetOpenOrders(): Updating nextValidId from {_nextValidId} to {lastOrderId + 1}");
                     _nextValidId = lastOrderId + 1;
                 }
+            }
+
+            // IB doesn't report the original submission time for open orders, so their timestamp is set
+            // to the time they were fetched. Warn the user once so they don't rely on it being accurate.
+            if (orders.Count > 0 && !_openOrderTimeWarningSent)
+            {
+                _openOrderTimeWarningSent = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning,
+                    "OpenOrderTimeWarning",
+                    "Interactive Brokers does not provide the original submission time for open orders; their time is set to when they were fetched."));
             }
 
             // convert results to Lean Orders outside the eventhandler to avoid nesting requests, as conversion may request
@@ -1975,12 +1988,41 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="price">Price to be normalized</param>
         /// <param name="contract">Contract of the symbol</param>
         /// <param name="symbol">The symbol from which we need to get the PriceMagnifier attribute to normalize the price</param>
+        /// <param name="orderType">The order type, used for special cases like Index Options ComboLimit orders</param>
         /// <returns>The price normalized to be brokerage expected unit</returns>
-        public double NormalizePriceToBrokerage(decimal price, Contract contract, Symbol symbol)
+        public double NormalizePriceToBrokerage(decimal price, Contract contract, Symbol symbol, OrderType? orderType = null)
         {
             var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, Currencies.USD);
-            var roundedPrice = RoundPrice(price, _contractSpecificationService.GetMinTick(contract, symbol));
+
+            var minTick = 0m;
+            switch (symbol.SecurityType)
+            {
+                case SecurityType.IndexOption when orderType is not (OrderType.ComboLimit or OrderType.ComboLegLimit):
+                    minTick = IndexOptionSymbolProperties.MinimumPriceVariationForPrice(symbol, price);
+                    break;
+                default:
+                    minTick = _contractSpecificationService.GetMinTick(contract, symbol);
+                    break;
+            }
+
+            var roundedPrice = RoundPrice(price, minTick);
             roundedPrice *= symbolProperties.PriceMagnifier;
+
+            if (!price.Equals(roundedPrice))
+            {
+                var message = $"To meet brokerage precision requirements, price was rounded to {roundedPrice.ToStringInvariant()} from {price.ToStringInvariant()} due to minimum tick size constraint ({minTick}).";
+
+                if (_hasLoggedPriceRoundingWarning)
+                {
+                    Log.Trace("InteractiveBrokersBrokerage.NormalizePriceToBrokerage(): " + message);
+                }
+                else
+                {
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "PriceRounding", message));
+                    _hasLoggedPriceRoundingWarning = true;
+                }
+            }
+
             return Convert.ToDouble(roundedPrice);
         }
 
@@ -2083,6 +2125,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             Log.Trace($"InteractiveBrokersBrokerage.HandleError(): RequestId: {requestId} ErrorCode: {errorCode} - {errorMsg}");
+
+            // error 300: "Can't find EId with tickerId:N" - IB rejecting a cancelMktData for a ticker
+            // it has no active subscription for. This is benign only when it's a market-data ticker we
+            // have already unsubscribed (the async cancel races the removal, common during teardown).
+            // In that case _subscribedTickers no longer has the id; otherwise let the error surface.
+            if (errorCode == 300
+                && requestInfo?.RequestType == RequestType.Subscription
+                && !_subscribedTickers.ContainsKey(requestId))
+            {
+                Log.Trace($"InteractiveBrokersBrokerage.HandleError(): Ignoring benign cancel-market-data error for an already-unsubscribed ticker. ErrorCode: {errorCode} - {errorMsg}");
+                return;
+            }
 
             if (errorCode == 2105 || errorCode == 2103)
             {
@@ -2962,19 +3016,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 quantity = order.Quantity;
             }
 
-            var outsideRth = false;
             var orderProperties = order.Properties as InteractiveBrokersOrderProperties;
-            if (order.Type == OrderType.Limit ||
-                order.Type == OrderType.LimitIfTouched ||
-                order.Type == OrderType.StopMarket ||
-                order.Type == OrderType.StopLimit ||
-                order.Type == OrderType.TrailingStop)
-            {
-                if (orderProperties != null)
-                {
-                    outsideRth = orderProperties.OutsideRegularTradingHours;
-                }
-            }
+            var outsideRth = GetOutsideRegularTradingHours(order.Type, orderProperties);
 
             var ibOrder = new IBApi.Order
             {
@@ -3035,7 +3078,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     ibOrder.OrderComboLegs.Add(new OrderComboLeg
                     {
-                        Price = NormalizePriceToBrokerage(comboLegLimit.LimitPrice, legContract, comboLegLimit.Symbol)
+                        Price = NormalizePriceToBrokerage(comboLegLimit.LimitPrice, legContract, comboLegLimit.Symbol, comboLegLimit.Type)
                     });
                 }
             }
@@ -3074,7 +3117,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 AddGuaranteedTag(ibOrder, orders.All(x => x.SecurityType == SecurityType.Equity));
                 var baseContract = CreateContract(order.Symbol, includeExpired: false);
-                ibOrder.LmtPrice = NormalizePriceToBrokerage(comboLimitOrder.GroupOrderManager.LimitPrice, baseContract, order.Symbol);
+                ibOrder.LmtPrice = NormalizePriceToBrokerage(comboLimitOrder.GroupOrderManager.LimitPrice, baseContract, order.Symbol, order.Type);
             }
             else if (comboMarketOrder != null)
             {
@@ -3105,8 +3148,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!string.IsNullOrWhiteSpace(orderProperties.Account))
                     {
-                        // order for a single managed account
+                        // order for a single managed account.
+                        // IB requires Account, FaGroup and FaProfile to be mutually exclusive on the wire —
+                        // if both Account and FaGroup are sent, IB rejects with error 201 "Invalid account
+                        // number". Clear any FaGroup/FaMethod that the global financial-advisors group
+                        // filter assigned earlier so the per-order Account override is unambiguous.
                         ibOrder.Account = orderProperties.Account;
+                        ibOrder.FaGroup = string.Empty;
+                        ibOrder.FaMethod = string.Empty;
                     }
                     else if (!string.IsNullOrWhiteSpace(orderProperties.FaGroup) || !string.IsNullOrWhiteSpace(orderProperties.FaProfile))
                     {
@@ -3235,10 +3284,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
             double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState)
         {
-            // this function is called by GetOpenOrders which is mainly used by the setup handler to
-            // initialize algorithm state.  So the only time we'll be executing this code is when the account
-            // has orders sitting and waiting from before algo initialization...
-            // because of this we can't get the time accurately
+            // GetOpenOrders rebuilds orders that predate the algorithm; IB doesn't report their original
+            // submission time, so we stamp the discovery time instead of DateTime.MinValue to keep
+            // time-based cancel/age logic working after a restart. Rounded down to the minute since the
+            // exact time isn't meaningful.
+            var orderTime = DateTime.UtcNow.RoundDown(TimeSpan.FromMinutes(1));
 
             Order order;
             var mappedSymbol = MapSymbol(contract);
@@ -3247,20 +3297,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 case OrderType.Market:
                     order = new MarketOrder(mappedSymbol,
                         quantity,
-                        new DateTime() // not sure how to get this data
+                        orderTime
                         );
                     break;
 
                 case OrderType.MarketOnOpen:
                     order = new MarketOnOpenOrder(mappedSymbol,
                         quantity,
-                        new DateTime());
+                        orderTime);
                     break;
 
                 case OrderType.MarketOnClose:
                     order = new MarketOnCloseOrder(mappedSymbol,
                         quantity,
-                        new DateTime()
+                        orderTime
                         );
                     break;
 
@@ -3268,7 +3318,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new LimitOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime()
+                        orderTime
                         );
                     break;
 
@@ -3276,7 +3326,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new StopMarketOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
-                        new DateTime()
+                        orderTime
                         );
                     break;
 
@@ -3285,7 +3335,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime()
+                        orderTime
                         );
                     break;
 
@@ -3308,7 +3358,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(trailingStopPrice, mappedSymbol),
                         trailingAmount,
                         trailingAsPecentage,
-                        new DateTime()
+                        orderTime
                     );
                     break;
 
@@ -3317,14 +3367,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime()
+                        orderTime
                     );
                     break;
 
                 case OrderType.ComboMarket:
                     order = new ComboMarketOrder(mappedSymbol,
                         quantity,
-                        new DateTime(),
+                        orderTime,
                         groupOrderManager
                     );
                     break;
@@ -3333,7 +3383,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new ComboLimitOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime(),
+                        orderTime,
                         groupOrderManager
                     );
                     break;
@@ -3342,7 +3392,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new ComboLegLimitOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime(),
+                        orderTime,
                         groupOrderManager
                     );
                     break;
@@ -3422,6 +3472,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 if (string.Equals(symbol.ID.Market, Market.OSE, StringComparison.InvariantCultureIgnoreCase))
                 {
                     contract.Exchange = "OSE.JPN";
+                }
+                else if(string.Equals(symbol.ID.Market, Market.KRX, StringComparison.InvariantCultureIgnoreCase))
+                {
+                    contract.Exchange = "KSE";
                 }
                 else
                 {
@@ -3558,6 +3612,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 default:
                     throw new InvalidEnumArgumentException(nameof(type), (int)type, typeof(OrderType));
             }
+        }
+
+        /// <summary>
+        /// Resolves the outside-RTH flag to send to IB, and emits a one-shot warning when the
+        /// user requested the flag on a combo order. IB server-side ignores the flag on combo
+        /// (BAG) orders (returns warning 2109), so we don't propagate it and tell the user once.
+        /// </summary>
+        internal bool GetOutsideRegularTradingHours(OrderType orderType, InteractiveBrokersOrderProperties orderProperties)
+        {
+            if (orderProperties?.OutsideRegularTradingHours != true)
+            {
+                return false;
+            }
+
+            return orderType is OrderType.Limit
+                or OrderType.LimitIfTouched
+                or OrderType.StopMarket
+                or OrderType.StopLimit
+                or OrderType.TrailingStop
+                or OrderType.ComboMarket
+                or OrderType.ComboLimit
+                or OrderType.ComboLegLimit;
         }
 
         /// <summary>
@@ -4344,10 +4420,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // our subscriptions are removed without any sort of notice.
             return
                 (securityType == SecurityType.Equity && market == Market.USA) ||
-                (securityType == SecurityType.Forex && market == Market.Oanda) ||
+                (securityType == SecurityType.Forex && (market == Market.Oanda || market == Market.InteractiveBrokers)) ||
                 (securityType == SecurityType.Option && market == Market.USA) ||
                 (securityType == SecurityType.IndexOption && market == Market.USA) ||
-                (securityType == SecurityType.Index && (market == Market.USA || market == Market.EUREX || market == Market.OSE || market == Market.HKFE)) ||
+                (securityType == SecurityType.Index && (market == Market.USA || market == Market.EUREX || market == Market.OSE || market == Market.HKFE || market == Market.KRX)) ||
                 (securityType == SecurityType.FutureOption) ||
                 (securityType == SecurityType.Future) ||
                 (securityType == SecurityType.Cfd && market == Market.InteractiveBrokers);
@@ -5222,7 +5298,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 var resultHandler = Composer.Instance.GetPart<IResultHandler>();
                 resultHandler?.DebugMessage("Logging into account. Check phone for two-factor authentication verification...");
             }
-            else if (e.Data.Contains("2FA maximum attempts reached", StringComparison.InvariantCultureIgnoreCase))
+            else if (e.Data.Contains("2FA maximum attempts reached", StringComparison.InvariantCultureIgnoreCase) || 
+                     e.Data.Contains("IB Automater initialization timeout", StringComparison.InvariantCultureIgnoreCase))
             {
                 Task.Factory.StartNew(() =>
                 {
@@ -5623,7 +5700,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private bool IsRecuperable2FATimeout(StartResult result)
         {
-            if (_pastFirstConnection && result.ErrorCode == ErrorCode.TwoFactorConfirmationTimeout)
+            if (_pastFirstConnection && (result.ErrorCode == ErrorCode.TwoFactorConfirmationTimeout || result.ErrorCode == ErrorCode.InitializationTimeout))
             {
                 Log.Trace($"InteractiveBrokersBrokerage.IsRecuperable2FATimeout(): will trigger user action request");
                 return true;
