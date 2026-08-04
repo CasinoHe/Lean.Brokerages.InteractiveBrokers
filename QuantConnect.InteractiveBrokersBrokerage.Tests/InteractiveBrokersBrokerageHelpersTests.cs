@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 using NUnit.Framework;
@@ -135,6 +136,81 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreNotEqual(
                 InteractiveBrokersBrokerage.GetUniqueKey(madrid),
                 InteractiveBrokersBrokerage.GetUniqueKey(paris));
+        }
+
+        [Test]
+        public void UniqueResolvedContractIsCachedUnderOriginalRequestKey()
+        {
+            var request = new IBApi.Contract
+            {
+                Symbol = "AAPL",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "USD"
+            };
+            var resolvedDetails = new IBApi.ContractDetails
+            {
+                Contract = new IBApi.Contract
+                {
+                    Symbol = "AAPL",
+                    SecType = IB.SecurityType.Stock,
+                    Exchange = "SMART",
+                    Currency = "USD",
+                    PrimaryExch = "NASDAQ"
+                }
+            };
+            var cache = new ConcurrentDictionary<string, IBApi.ContractDetails>();
+
+            InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(
+                cache,
+                request,
+                new[] { resolvedDetails });
+
+            Assert.AreSame(
+                resolvedDetails,
+                cache[InteractiveBrokersBrokerage.GetUniqueKey(request)]);
+        }
+
+        [Test]
+        public void AmbiguousContractDetailsAreNotCachedUnderOriginalRequestKey()
+        {
+            var request = new IBApi.Contract
+            {
+                Symbol = "SAN",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "EUR"
+            };
+            var cache = new ConcurrentDictionary<string, IBApi.ContractDetails>();
+            var matches = new[]
+            {
+                new IBApi.ContractDetails
+                {
+                    Contract = new IBApi.Contract
+                    {
+                        Symbol = "SAN",
+                        SecType = IB.SecurityType.Stock,
+                        Exchange = "SMART",
+                        Currency = "EUR",
+                        PrimaryExch = "BM"
+                    }
+                },
+                new IBApi.ContractDetails
+                {
+                    Contract = new IBApi.Contract
+                    {
+                        Symbol = "SAN",
+                        SecType = IB.SecurityType.Stock,
+                        Exchange = "SMART",
+                        Currency = "EUR",
+                        PrimaryExch = "SBF"
+                    }
+                }
+            };
+
+            InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(cache, request, matches);
+
+            Assert.IsFalse(cache.ContainsKey(InteractiveBrokersBrokerage.GetUniqueKey(request)));
         }
 
         [Test]

@@ -1851,6 +1851,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return $"{contract.ToString().ToUpperInvariant()} {contract.LastTradeDateOrContractMonth.ToStringInvariant()} {contract.Strike.ToStringInvariant()} {contract.Right} {contract.TradingClass}";
         }
 
+        internal static void CacheContractDetailsRequestAlias(
+            ConcurrentDictionary<string, ContractDetails> cache,
+            Contract requestedContract,
+            IReadOnlyList<ContractDetails> resolvedContractDetails)
+        {
+            if (resolvedContractDetails.Count == 1)
+            {
+                cache.TryAdd(GetUniqueKey(requestedContract), resolvedContractDetails[0]);
+            }
+        }
+
         /// <summary>
         /// Get Contract Description
         /// </summary>
@@ -2030,6 +2041,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.ContractDetails -= clientOnContractDetails;
 
             Log.Trace($"InteractiveBrokersBrokerage.GetContractDetails(): contracts found: {contractDetailsList.Count}");
+
+            // IBKR can populate fields omitted from a uniquely resolved request, such as
+            // PrimaryExch for U.S. equities. Preserve the venue-specific response key while
+            // also making the original request reusable. Never alias ambiguous responses.
+            CacheContractDetailsRequestAlias(_contractDetails, contract, contractDetailsList);
 
             return contractDetailsList.FirstOrDefault();
         }
