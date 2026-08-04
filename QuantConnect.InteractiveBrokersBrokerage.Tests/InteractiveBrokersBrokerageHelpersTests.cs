@@ -14,10 +14,13 @@
 */
 
 using System;
+using System.Collections.Generic;
 
 using NUnit.Framework;
 
+using QuantConnect;
 using QuantConnect.Brokerages.InteractiveBrokers;
+using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
@@ -25,7 +28,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     public class InteractiveBrokersBrokerageHelpersTests
     {
         [Test]
-
         public void GetsNextSunday()
         {
             var baseDate = new DateTime(2022, 12, 5); // Monday
@@ -52,6 +54,107 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var expectedTime = expectedSunday.Date.Add(restartTimeOfDay);
 
             Assert.AreEqual(expectedTime, time);
+        }
+
+        [TestCaseSource(nameof(EuropeanEquityMarkets))]
+        public void EuropeanPrimaryListingCanSubscribeAndKeepsVenueIdentity(
+            string market,
+            string expectedPrimaryExchange)
+        {
+            var symbol = Symbol.Create("SAN", SecurityType.Equity, market);
+
+            Assert.IsTrue(InteractiveBrokersBrokerage.CanSubscribe(symbol));
+            Assert.AreEqual(
+                expectedPrimaryExchange,
+                InteractiveBrokersBrokerage.GetPrimaryExchangeForMarket(market));
+        }
+
+        [TestCaseSource(nameof(EuropeanEquityMarkets))]
+        public void EuropeanPrimaryExchangeRoundTripsToLeanMarket(
+            string expectedMarket,
+            string primaryExchange)
+        {
+            Assert.AreEqual(
+                expectedMarket,
+                InteractiveBrokersBrokerage.GetMarketForPrimaryExchange(primaryExchange));
+        }
+
+        [TestCase("BM", Market.XMAD)]
+        [TestCase("SBF", Market.XPAR)]
+        public void IncomingDuplicateTickerPreservesPrimaryVenue(
+            string primaryExchange,
+            string expectedMarket)
+        {
+            var contract = new IBApi.Contract
+            {
+                Symbol = "SAN",
+                SecType = IB.SecurityType.Stock,
+                PrimaryExch = primaryExchange
+            };
+
+            Assert.AreEqual(
+                expectedMarket,
+                InteractiveBrokersBrokerage.GetMarketForContract(contract, SecurityType.Equity));
+        }
+
+        [TestCase(Market.XPAR, "SAN", "SAN1")]
+        [TestCase(Market.XHEL, "NDA-FI", "NDA FI")]
+        public void EuropeanEquityBrokerAliasesRoundTrip(
+            string market,
+            string leanTicker,
+            string brokerageTicker)
+        {
+            Assert.AreEqual(
+                brokerageTicker,
+                InteractiveBrokersBrokerage.GetBrokerageEquitySymbol(market, leanTicker));
+            Assert.AreEqual(
+                leanTicker,
+                InteractiveBrokersBrokerage.GetLeanEquitySymbol(market, brokerageTicker));
+        }
+
+        [Test]
+        public void ContractCacheKeyIncludesPrimaryExchange()
+        {
+            var madrid = new IBApi.Contract
+            {
+                Symbol = "SAN",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "EUR",
+                PrimaryExch = "BM"
+            };
+            var paris = new IBApi.Contract
+            {
+                Symbol = "SAN",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "EUR",
+                PrimaryExch = "SBF"
+            };
+
+            Assert.AreNotEqual(
+                InteractiveBrokersBrokerage.GetUniqueKey(madrid),
+                InteractiveBrokersBrokerage.GetUniqueKey(paris));
+        }
+
+        [Test]
+        public void UnsupportedEquityMarketIsRejected()
+        {
+            var symbol = Symbol.Create("SAN", SecurityType.Equity, Market.CBOE);
+
+            Assert.IsFalse(InteractiveBrokersBrokerage.CanSubscribe(symbol));
+            Assert.IsNull(InteractiveBrokersBrokerage.GetPrimaryExchangeForMarket(symbol.ID.Market));
+        }
+
+        private static IEnumerable<TestCaseData> EuropeanEquityMarkets()
+        {
+            yield return new TestCaseData(Market.XAMS, "AEB");
+            yield return new TestCaseData(Market.XBRU, "ENEXT.BE");
+            yield return new TestCaseData(Market.XETR, "IBIS");
+            yield return new TestCaseData(Market.XHEL, "HEX");
+            yield return new TestCaseData(Market.XMAD, "BM");
+            yield return new TestCaseData(Market.XMIL, "BVME");
+            yield return new TestCaseData(Market.XPAR, "SBF");
         }
 
         // (start date, next Sunday)

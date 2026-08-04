@@ -67,6 +67,34 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     [BrokerageFactory(typeof(InteractiveBrokersBrokerageFactory))]
     public sealed class InteractiveBrokersBrokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider
     {
+        private static readonly IReadOnlyDictionary<string, string> EuropeanPrimaryExchanges =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [Market.XETR] = "IBIS",
+                [Market.XPAR] = "SBF",
+                [Market.XAMS] = "AEB",
+                [Market.XBRU] = "ENEXT.BE",
+                [Market.XMIL] = "BVME",
+                [Market.XMAD] = "BM",
+                [Market.XHEL] = "HEX"
+            };
+        private static readonly IReadOnlyDictionary<string, string> EuropeanMarketsByPrimaryExchange =
+            EuropeanPrimaryExchanges.ToDictionary(
+                item => item.Value,
+                item => item.Key,
+                StringComparer.OrdinalIgnoreCase);
+        private static readonly IReadOnlyDictionary<string, string> EuropeanEquityBrokerSymbols =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [$"{Market.XPAR}|SAN"] = "SAN1",
+                [$"{Market.XHEL}|NDA-FI"] = "NDA FI"
+            };
+        private static readonly IReadOnlyDictionary<string, string> EuropeanEquityLeanSymbols =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [$"{Market.XPAR}|SAN1"] = "SAN",
+                [$"{Market.XHEL}|NDA FI"] = "NDA-FI"
+            };
         /// <summary>
         /// The name of the brokerage.
         /// </summary>
@@ -1808,7 +1836,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return false;
         }
 
-        private static string GetUniqueKey(Contract contract)
+        internal static string GetUniqueKey(Contract contract)
         {
             var leanSecurityType = ConvertSecurityType(contract);
             if (leanSecurityType == SecurityType.Equity ||
@@ -1816,7 +1844,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 leanSecurityType == SecurityType.Cfd ||
                 leanSecurityType == SecurityType.Index)
             {
-                return contract.ToString().ToUpperInvariant();
+                return $"{contract.ToString().ToUpperInvariant()} {(contract.PrimaryExch ?? string.Empty).ToUpperInvariant()}";
             }
 
             // for IB trading class can be different depending on the contract flavor, e.g. index options SPX & SPXW
@@ -1846,6 +1874,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </returns>
         internal string GetPrimaryExchange(Contract contract, Symbol symbol)
         {
+            var europeanPrimaryExchange = GetPrimaryExchangeForMarket(symbol.ID.Market);
+            if (europeanPrimaryExchange != null)
+            {
+                return europeanPrimaryExchange;
+            }
+
             if (symbol.ID.Market.Equals(Market.USA, StringComparison.InvariantCultureIgnoreCase))
             {
                 var leanExchange = _exchangeProvider.GetPrimaryExchange(symbol.ID)?.Name;
@@ -1856,6 +1890,48 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             return GetContractDetails(contract, symbol.Value)?.Contract.PrimaryExch;
+        }
+
+        internal static string GetPrimaryExchangeForMarket(string market)
+        {
+            return EuropeanPrimaryExchanges.TryGetValue(market, out var primaryExchange)
+                ? primaryExchange
+                : null;
+        }
+
+        internal static string GetMarketForPrimaryExchange(string primaryExchange)
+        {
+            return !string.IsNullOrWhiteSpace(primaryExchange)
+                && EuropeanMarketsByPrimaryExchange.TryGetValue(primaryExchange, out var market)
+                    ? market
+                    : null;
+        }
+
+        internal static string GetMarketForContract(Contract contract, SecurityType securityType)
+        {
+            if (securityType == SecurityType.Equity)
+            {
+                var europeanMarket = GetMarketForPrimaryExchange(contract.PrimaryExch);
+                if (europeanMarket != null)
+                {
+                    return europeanMarket;
+                }
+            }
+            return InteractiveBrokersBrokerageModel.DefaultMarketMap[securityType];
+        }
+
+        internal static string GetBrokerageEquitySymbol(string market, string leanTicker)
+        {
+            return EuropeanEquityBrokerSymbols.TryGetValue($"{market}|{leanTicker}", out var brokerageTicker)
+                ? brokerageTicker
+                : leanTicker;
+        }
+
+        internal static string GetLeanEquitySymbol(string market, string brokerageTicker)
+        {
+            return EuropeanEquityLeanSymbols.TryGetValue($"{market}|{brokerageTicker}", out var leanTicker)
+                ? leanTicker
+                : brokerageTicker;
         }
 
         /// <summary>
@@ -3419,6 +3495,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var securityType = ConvertSecurityType(symbol.SecurityType);
             var ibSymbol = _symbolMapper.GetBrokerageSymbol(symbol);
+            if (symbol.SecurityType == SecurityType.Equity)
+            {
+                ibSymbol = GetBrokerageEquitySymbol(symbol.ID.Market, ibSymbol);
+            }
 
             var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(
                 symbol.ID.Market,
@@ -4044,7 +4124,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                 }
 
-                var market = InteractiveBrokersBrokerageModel.DefaultMarketMap[securityType];
+                var market = GetMarketForContract(contract, securityType);
+                if (securityType == SecurityType.Equity)
+                {
+                    ibSymbol = GetLeanEquitySymbol(market, ibSymbol);
+                }
                 var isFutureOption = contract.SecType == IB.SecurityType.FutureOption;
 
                 if (securityType.IsOption() && contract.LastTradeDateOrContractMonth == "0")
@@ -4404,7 +4488,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         /// <param name="symbol">The symbol to be handled</param>
         /// <returns>True if this data provider can get data for the symbol, false otherwise</returns>
-        private static bool CanSubscribe(Symbol symbol)
+        internal static bool CanSubscribe(Symbol symbol)
         {
             var market = symbol.ID.Market;
             var securityType = symbol.ID.SecurityType;
@@ -4419,7 +4503,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // Include future options as a special case with no matching market, otherwise
             // our subscriptions are removed without any sort of notice.
             return
-                (securityType == SecurityType.Equity && market == Market.USA) ||
+                (securityType == SecurityType.Equity &&
+                    (market == Market.USA || GetPrimaryExchangeForMarket(market) != null)) ||
                 (securityType == SecurityType.Forex && (market == Market.Oanda || market == Market.InteractiveBrokers)) ||
                 (securityType == SecurityType.Option && market == Market.USA) ||
                 (securityType == SecurityType.IndexOption && market == Market.USA) ||
