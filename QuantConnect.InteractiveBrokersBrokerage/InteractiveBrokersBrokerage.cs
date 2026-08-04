@@ -73,7 +73,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 [Market.XETR] = "IBIS",
                 [Market.XPAR] = "SBF",
                 [Market.XAMS] = "AEB",
-                [Market.XBRU] = "ENEXT.BE",
+                [Market.XBRU] = "ENEXT",
                 [Market.XMIL] = "BVME",
                 [Market.XMAD] = "BM",
                 [Market.XHEL] = "HEX"

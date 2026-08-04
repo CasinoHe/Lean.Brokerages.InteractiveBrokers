@@ -149,7 +149,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static IEnumerable<TestCaseData> EuropeanEquityMarkets()
         {
             yield return new TestCaseData(Market.XAMS, "AEB");
-            yield return new TestCaseData(Market.XBRU, "ENEXT.BE");
+            yield return new TestCaseData(Market.XBRU, "ENEXT");
             yield return new TestCaseData(Market.XETR, "IBIS");
             yield return new TestCaseData(Market.XHEL, "HEX");
             yield return new TestCaseData(Market.XMAD, "BM");
