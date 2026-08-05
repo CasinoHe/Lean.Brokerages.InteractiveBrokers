@@ -80,6 +80,22 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 InteractiveBrokersBrokerage.GetMarketForPrimaryExchange(primaryExchange));
         }
 
+        [TestCase("ENEXT")]
+        [TestCase("ENEXT.BE")]
+        public void IncomingBrusselsPrimaryExchangePreservesXbruMarket(string primaryExchange)
+        {
+            var contract = new IBApi.Contract
+            {
+                Symbol = "ABI",
+                SecType = IB.SecurityType.Stock,
+                PrimaryExch = primaryExchange
+            };
+
+            Assert.AreEqual(
+                Market.XBRU,
+                InteractiveBrokersBrokerage.GetMarketForContract(contract, SecurityType.Equity));
+        }
+
         [TestCase("BM", Market.XMAD)]
         [TestCase("SBF", Market.XPAR)]
         public void IncomingDuplicateTickerPreservesPrimaryVenue(

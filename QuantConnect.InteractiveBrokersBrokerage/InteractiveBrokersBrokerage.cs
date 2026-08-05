@@ -79,10 +79,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 [Market.XHEL] = "HEX"
             };
         private static readonly IReadOnlyDictionary<string, string> EuropeanMarketsByPrimaryExchange =
-            EuropeanPrimaryExchanges.ToDictionary(
-                item => item.Value,
-                item => item.Key,
-                StringComparer.OrdinalIgnoreCase);
+            CreateEuropeanMarketsByPrimaryExchange();
         private static readonly IReadOnlyDictionary<string, string> EuropeanEquityBrokerSymbols =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
@@ -1909,6 +1906,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return EuropeanPrimaryExchanges.TryGetValue(market, out var primaryExchange)
                 ? primaryExchange
                 : null;
+        }
+
+        private static IReadOnlyDictionary<string, string> CreateEuropeanMarketsByPrimaryExchange()
+        {
+            var marketsByPrimaryExchange = EuropeanPrimaryExchanges.ToDictionary(
+                item => item.Value,
+                item => item.Key,
+                StringComparer.OrdinalIgnoreCase);
+            marketsByPrimaryExchange["ENEXT.BE"] = Market.XBRU;
+            return marketsByPrimaryExchange;
         }
 
         internal static string GetMarketForPrimaryExchange(string primaryExchange)
