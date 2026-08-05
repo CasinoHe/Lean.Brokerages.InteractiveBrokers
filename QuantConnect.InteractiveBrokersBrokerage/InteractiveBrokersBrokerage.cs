@@ -1854,9 +1854,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         internal static void CacheContractDetailsRequestAlias(
             ConcurrentDictionary<string, ContractDetails> cache,
             Contract requestedContract,
-            IReadOnlyList<ContractDetails> resolvedContractDetails)
+            IReadOnlyList<ContractDetails> resolvedContractDetails,
+            bool requestCompletedSuccessfully)
         {
-            if (resolvedContractDetails.Count == 1)
+            if (requestCompletedSuccessfully && resolvedContractDetails.Count == 1)
             {
                 cache.TryAdd(GetUniqueKey(requestedContract), resolvedContractDetails[0]);
             }
@@ -1975,6 +1976,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var requestId = GetNextId();
 
             var contractDetailsList = new List<ContractDetails>();
+            var requestCompleted = 0;
+            var requestFailed = 0;
 
             Log.Trace($"InteractiveBrokersBrokerage.GetContractDetails(): {ticker} ({contract})");
 
@@ -2009,6 +2012,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (args.RequestId == requestId)
                 {
+                    Interlocked.Exchange(ref requestCompleted, 1);
                     manualResetEvent.Set();
                 }
             };
@@ -2017,6 +2021,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (args.Id == requestId)
                 {
+                    Interlocked.Exchange(ref requestFailed, 1);
                     manualResetEvent.Set();
                 }
             };
@@ -2030,7 +2035,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // make the request for data
             _client.ClientSocket.reqContractDetails(requestId, contract);
 
-            if (!manualResetEvent.WaitOne(timeout * 1000))
+            var requestFinishedBeforeTimeout = manualResetEvent.WaitOne(timeout * 1000);
+            if (!requestFinishedBeforeTimeout)
             {
                 Log.Error("InteractiveBrokersBrokerage.GetContractDetails(): failed to receive response from IB within {0} seconds", timeout);
             }
@@ -2045,7 +2051,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // IBKR can populate fields omitted from a uniquely resolved request, such as
             // PrimaryExch for U.S. equities. Preserve the venue-specific response key while
             // also making the original request reusable. Never alias ambiguous responses.
-            CacheContractDetailsRequestAlias(_contractDetails, contract, contractDetailsList);
+            CacheContractDetailsRequestAlias(
+                _contractDetails,
+                contract,
+                contractDetailsList,
+                requestFinishedBeforeTimeout &&
+                    Volatile.Read(ref requestCompleted) == 1 &&
+                    Volatile.Read(ref requestFailed) == 0);
 
             return contractDetailsList.FirstOrDefault();
         }

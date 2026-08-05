@@ -164,7 +164,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(
                 cache,
                 request,
-                new[] { resolvedDetails });
+                new[] { resolvedDetails },
+                requestCompletedSuccessfully: true);
 
             Assert.AreSame(
                 resolvedDetails,
@@ -208,9 +209,25 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
             };
 
-            InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(cache, request, matches);
+            InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(
+                cache,
+                request,
+                matches,
+                requestCompletedSuccessfully: true);
 
             Assert.IsFalse(cache.ContainsKey(InteractiveBrokersBrokerage.GetUniqueKey(request)));
+        }
+
+        [Test]
+        public void PartialContractDetailsBeforeErrorAreNotCachedUnderOriginalRequestKey()
+        {
+            AssertIncompleteContractDetailsAreNotCachedUnderOriginalRequestKey();
+        }
+
+        [Test]
+        public void PartialContractDetailsBeforeTimeoutAreNotCachedUnderOriginalRequestKey()
+        {
+            AssertIncompleteContractDetailsAreNotCachedUnderOriginalRequestKey();
         }
 
         [Test]
@@ -231,6 +248,37 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             yield return new TestCaseData(Market.XMAD, "BM");
             yield return new TestCaseData(Market.XMIL, "BVME");
             yield return new TestCaseData(Market.XPAR, "SBF");
+        }
+
+        private static void AssertIncompleteContractDetailsAreNotCachedUnderOriginalRequestKey()
+        {
+            var request = new IBApi.Contract
+            {
+                Symbol = "SAN",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "EUR"
+            };
+            var partialDetails = new IBApi.ContractDetails
+            {
+                Contract = new IBApi.Contract
+                {
+                    Symbol = "SAN",
+                    SecType = IB.SecurityType.Stock,
+                    Exchange = "SMART",
+                    Currency = "EUR",
+                    PrimaryExch = "BM"
+                }
+            };
+            var cache = new ConcurrentDictionary<string, IBApi.ContractDetails>();
+
+            InteractiveBrokersBrokerage.CacheContractDetailsRequestAlias(
+                cache,
+                request,
+                new[] { partialDetails },
+                requestCompletedSuccessfully: false);
+
+            Assert.IsFalse(cache.ContainsKey(InteractiveBrokersBrokerage.GetUniqueKey(request)));
         }
 
         // (start date, next Sunday)
